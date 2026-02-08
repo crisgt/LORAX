@@ -1,262 +1,172 @@
 import runpod
 import json
-import base64
 import subprocess
 import os
 import time
 import requests
-from PIL import Image
-from io import BytesIO
+import base64
+
+print("Handler starting...", flush=True)
 
 def handler(event):
-    """
-    Handle ComfyUI workflow execution
+    """Simple handler that accepts workflow JSON"""
+    print("=" * 50, flush=True)
+    print("Handler called!", flush=True)
     
-    Expected input:
-    {
-        "workflow": {...},  // Full ComfyUI workflow JSON
-        "prompt": "optional override",  // Optional: overrides prompt in workflow
-        "seed": null  // Optional: overrides seed in workflow
-    }
-    
-    OR for simple text-to-image without full workflow:
-    {
-        "prompt": "your prompt here",
-        "width": 832,
-        "height": 1216,
-        "steps": 35,
-        "guidance": 4.0,
-        "seed": null
-    }
-    """
     try:
-        input_data = event["input"]
+        input_data = event.get("input", {})
+        print(f"Received input with keys: {list(input_data.keys())}", flush=True)
         
-        # Check if workflow is provided
+        # Get workflow
         if "workflow" not in input_data:
-            return {
-                "error": "No workflow provided. Please include 'workflow' key with ComfyUI workflow JSON"
-            }
+            return {"error": "Missing 'workflow' in input"}
         
         workflow = input_data["workflow"]
+        print(f"Workflow has {len(workflow.get('nodes', []))} nodes", flush=True)
         
-        # Optional overrides
-        prompt_override = input_data.get("prompt", None)
-        seed_override = input_data.get("seed", None)
+        # Save workflow to temp file
+        workflow_file = "/tmp/workflow_api.json"
+        with open(workflow_file, 'w') as f:
+            json.dump(workflow, f)
+        print(f"Saved workflow to {workflow_file}", flush=True)
         
-        # Apply overrides if provided
-        if prompt_override:
-            print(f"Overriding prompt: {prompt_override[:50]}...")
-            for node in workflow["nodes"]:
-                if node.get("type") == "CLIPTextEncode":
-                    if "widgets_values" in node and len(node["widgets_values"]) > 0:
-                        node["widgets_values"][0] = prompt_override
-                        break
+        # Check volume
+        volume_path = "/runpod-volume/ComfyUI/models"
+        if os.path.exists(volume_path):
+            print(f"✓ Volume found at {volume_path}", flush=True)
+        else:
+            return {"error": f"Volume not found at {volume_path}"}
         
-        if seed_override is not None:
-            print(f"Overriding seed: {seed_override}")
-            for node in workflow["nodes"]:
-                if node.get("type") == "RandomNoise":
-                    if "widgets_values" in node and len(node["widgets_values"]) >= 2:
-                        node["widgets_values"][0] = seed_override
-                        node["widgets_values"][1] = "fixed"
-                        break
+        # Start ComfyUI server
+        print("Starting ComfyUI server...", flush=True)
         
-        # Generate unique ID for this request
-        import random
-        request_id = random.randint(100000, 999999)
+        env = os.environ.copy()
+        env["COMFYUI_MODEL_PATHS"] = json.dumps({
+            "checkpoints": "/runpod-volume/ComfyUI/models/unet",
+            "vae": "/runpod-volume/ComfyUI/models/vae",
+            "clip": "/runpod-volume/ComfyUI/models/clip",
+            "loras": "/runpod-volume/ComfyUI/models/loras",
+        })
         
-        print(f"Processing workflow request #{request_id}")
+        comfyui_cmd = [
+            "python", "/app/ComfyUI/main.py",
+            "--listen", "127.0.0.1",
+            "--port", "8188",
+            "--output-directory", "/tmp/output"
+        ]
         
-        # Start ComfyUI server in background
-        print("Starting ComfyUI server...")
-        comfyui_process = subprocess.Popen(
-            ["python", "/app/ComfyUI/main.py", "--listen", "127.0.0.1", "--port", "8188"],
+        process = subprocess.Popen(
+            comfyui_cmd,
+            env=env,
             stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE
+            stderr=subprocess.STDOUT,
+            text=True
         )
         
-        # Wait for server to start
-        max_startup_wait = 30
+        # Wait for server to be ready
+        print("Waiting for ComfyUI to start...", flush=True)
         server_ready = False
-        for i in range(max_startup_wait):
+        
+        for i in range(60):
             try:
-                response = requests.get("http://127.0.0.1:8188/system_stats", timeout=1)
-                if response.status_code == 200:
+                resp = requests.get("http://127.0.0.1:8188/system_stats", timeout=2)
+                if resp.status_code == 200:
                     server_ready = True
-                    print(f"ComfyUI server ready after {i+1}s")
+                    print(f"✓ ComfyUI ready after {i+1}s", flush=True)
                     break
             except:
                 pass
             time.sleep(1)
         
         if not server_ready:
-            comfyui_process.kill()
-            return {"error": "ComfyUI server failed to start"}
+            process.kill()
+            return {"error": "ComfyUI failed to start within 60s"}
         
-        # Convert workflow to API prompt format
-        prompt_data = {"prompt": {}}
+        # Queue the workflow
+        print("Queueing workflow...", flush=True)
         
-        for node in workflow["nodes"]:
-            node_id = str(node["id"])
-            node_inputs = {}
-            
-            # Process inputs
-            if "inputs" in node:
-                for inp in node["inputs"]:
-                    inp_name = inp["name"]
-                    if "link" in inp and inp["link"] is not None:
-                        # This is a link to another node - skip for now
-                        pass
-                    elif "widget" in inp:
-                        # Widget input
-                        node_inputs[inp_name] = inp["widget"].get("value")
-            
-            # Add widget values
-            if "widgets_values" in node and node["widgets_values"]:
-                # Get widget parameter names from node type
-                # For common nodes, map widget values
-                if node["type"] == "CLIPTextEncode" and len(node["widgets_values"]) > 0:
-                    node_inputs["text"] = node["widgets_values"][0]
-                elif node["type"] == "KSamplerSelect" and len(node["widgets_values"]) > 0:
-                    node_inputs["sampler_name"] = node["widgets_values"][0]
-                elif node["type"] == "RandomNoise" and len(node["widgets_values"]) >= 2:
-                    node_inputs["noise_seed"] = node["widgets_values"][0]
-                elif node["type"] == "BasicScheduler" and len(node["widgets_values"]) >= 3:
-                    node_inputs["scheduler"] = node["widgets_values"][0]
-                    node_inputs["steps"] = node["widgets_values"][1]
-                    node_inputs["denoise"] = node["widgets_values"][2]
-                elif node["type"] == "FluxGuidance" and len(node["widgets_values"]) > 0:
-                    node_inputs["guidance"] = node["widgets_values"][0]
-                elif node["type"] == "UNETLoader" and len(node["widgets_values"]) >= 2:
-                    node_inputs["unet_name"] = node["widgets_values"][0]
-                    node_inputs["weight_dtype"] = node["widgets_values"][1]
-                elif node["type"] == "VAELoader" and len(node["widgets_values"]) > 0:
-                    node_inputs["vae_name"] = node["widgets_values"][0]
-                elif node["type"] == "DualCLIPLoader" and len(node["widgets_values"]) >= 2:
-                    node_inputs["clip_name1"] = node["widgets_values"][0]
-                    node_inputs["clip_name2"] = node["widgets_values"][1]
-                    if len(node["widgets_values"]) >= 3:
-                        node_inputs["type"] = node["widgets_values"][2]
-                elif node["type"] == "LoraLoaderModelOnly" and len(node["widgets_values"]) >= 2:
-                    node_inputs["lora_name"] = node["widgets_values"][0]
-                    node_inputs["strength_model"] = node["widgets_values"][1]
-                elif node["type"] == "ModelSamplingFlux" and len(node["widgets_values"]) >= 4:
-                    node_inputs["max_shift"] = node["widgets_values"][0]
-                    node_inputs["base_shift"] = node["widgets_values"][1]
-                    node_inputs["width"] = node["widgets_values"][2]
-                    node_inputs["height"] = node["widgets_values"][3]
-                elif node["type"] == "SaveImage" and len(node["widgets_values"]) > 0:
-                    node_inputs["filename_prefix"] = node["widgets_values"][0]
-            
-            prompt_data["prompt"][node_id] = {
-                "inputs": node_inputs,
-                "class_type": node["type"]
-            }
+        queue_url = "http://127.0.0.1:8188/prompt"
+        prompt_request = {"prompt": workflow}
         
-        # Process links
-        for link in workflow.get("links", []):
-            # link format: [link_id, source_node, source_slot, target_node, target_slot, type]
-            if len(link) >= 6:
-                source_node = str(link[1])
-                source_slot = link[2]
-                target_node = str(link[3])
-                target_slot = link[4]
-                
-                # Find the output name from source node
-                if source_node in prompt_data["prompt"]:
-                    source_node_data = next((n for n in workflow["nodes"] if n["id"] == int(source_node)), None)
-                    if source_node_data and "outputs" in source_node_data:
-                        if source_slot < len(source_node_data["outputs"]):
-                            output_name = source_node_data["outputs"][source_slot]["name"]
-                            
-                            # Find input name from target node
-                            target_node_data = next((n for n in workflow["nodes"] if n["id"] == int(target_node)), None)
-                            if target_node_data and "inputs" in target_node_data:
-                                if target_slot < len(target_node_data["inputs"]):
-                                    input_name = target_node_data["inputs"][target_slot]["name"]
-                                    
-                                    # Create the link in prompt format
-                                    prompt_data["prompt"][target_node]["inputs"][input_name] = [source_node, source_slot]
+        resp = requests.post(queue_url, json=prompt_request, timeout=10)
         
-        # Queue the prompt
-        print("Queueing workflow...")
-        url = "http://127.0.0.1:8188/prompt"
-        response = requests.post(url, json=prompt_data, timeout=10)
+        if resp.status_code != 200:
+            process.kill()
+            return {"error": f"Failed to queue: {resp.text}"}
         
-        if response.status_code != 200:
-            comfyui_process.kill()
-            return {"error": f"Failed to queue workflow: {response.text}"}
-        
-        result = response.json()
-        prompt_id = result.get("prompt_id")
+        queue_result = resp.json()
+        prompt_id = queue_result.get("prompt_id")
         
         if not prompt_id:
-            comfyui_process.kill()
-            return {"error": f"No prompt_id returned: {result}"}
+            process.kill()
+            return {"error": f"No prompt_id: {queue_result}"}
         
-        print(f"Workflow queued with prompt_id: {prompt_id}")
+        print(f"✓ Queued with prompt_id: {prompt_id}", flush=True)
         
         # Wait for completion
-        max_wait = 300  # 5 minutes
-        start_time = time.time()
+        print("Waiting for generation...", flush=True)
         output_images = []
         
-        while time.time() - start_time < max_wait:
+        for wait_count in range(150):  # 5 minutes max
             try:
-                history_response = requests.get(
-                    f"http://127.0.0.1:8188/history/{prompt_id}",
-                    timeout=5
-                )
+                history_resp = requests.get(f"http://127.0.0.1:8188/history/{prompt_id}", timeout=5)
                 
-                if history_response.status_code == 200:
-                    history = history_response.json()
+                if history_resp.status_code == 200:
+                    history = history_resp.json()
                     
                     if prompt_id in history:
+                        print(f"Found result in history", flush=True)
                         outputs = history[prompt_id].get("outputs", {})
                         
-                        # Find SaveImage node outputs
                         for node_id, node_output in outputs.items():
                             if "images" in node_output:
+                                print(f"Found images in node {node_id}", flush=True)
+                                
                                 for img_info in node_output["images"]:
-                                    # Download image
                                     filename = img_info.get("filename", "")
                                     subfolder = img_info.get("subfolder", "")
-                                    img_type = img_info.get("type", "output")
                                     
-                                    img_url = f"http://127.0.0.1:8188/view?filename={filename}&subfolder={subfolder}&type={img_type}"
+                                    # Download image
+                                    img_url = f"http://127.0.0.1:8188/view?filename={filename}&subfolder={subfolder}&type=output"
+                                    img_resp = requests.get(img_url, timeout=10)
                                     
-                                    img_response = requests.get(img_url, timeout=10)
-                                    
-                                    if img_response.status_code == 200:
-                                        img_str = base64.b64encode(img_response.content).decode()
-                                        output_images.append(img_str)
+                                    if img_resp.status_code == 200:
+                                        img_b64 = base64.b64encode(img_resp.content).decode()
+                                        output_images.append(img_b64)
+                                        print(f"✓ Got image: {filename}", flush=True)
                         
                         if output_images:
-                            print(f"Generated {len(output_images)} image(s)")
                             break
             except Exception as e:
-                print(f"Error checking status: {e}")
+                print(f"Wait loop error: {e}", flush=True)
+            
+            if wait_count % 10 == 0:
+                print(f"Still waiting... ({wait_count}s)", flush=True)
             
             time.sleep(2)
         
         # Cleanup
-        comfyui_process.kill()
+        process.kill()
         
         if not output_images:
-            return {"error": "No images generated within timeout period"}
+            return {"error": "No images generated"}
+        
+        print(f"✓ Success! Generated {len(output_images)} image(s)", flush=True)
         
         return {
+            "status": "success",
             "images": output_images,
-            "prompt_id": prompt_id,
-            "request_id": request_id
+            "prompt_id": prompt_id
         }
         
     except Exception as e:
         import traceback
+        error_trace = traceback.format_exc()
+        print(f"ERROR: {error_trace}", flush=True)
         return {
             "error": str(e),
-            "traceback": traceback.format_exc()
+            "traceback": error_trace
         }
 
+print("Starting RunPod handler...", flush=True)
 runpod.serverless.start({"handler": handler})
