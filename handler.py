@@ -22,31 +22,48 @@ def handler(event):
             return {"error": "Missing 'workflow' in input"}
         
         workflow = input_data["workflow"]
+        
+        # Handle if workflow is a string (needs parsing)
+        if isinstance(workflow, str):
+            print("Workflow is a string, parsing JSON...", flush=True)
+            try:
+                workflow = json.loads(workflow)
+            except json.JSONDecodeError as e:
+                return {"error": f"Invalid workflow JSON: {e}"}
+        
+        # Validate workflow structure
+        if not isinstance(workflow, dict):
+            return {"error": f"Workflow must be a JSON object, got {type(workflow)}"}
+        
+        if "nodes" not in workflow:
+            return {"error": "Workflow missing 'nodes' key"}
+        
         print(f"Workflow has {len(workflow.get('nodes', []))} nodes", flush=True)
+        
+        if len(workflow.get('nodes', [])) == 0:
+            return {"error": "Workflow has 0 nodes - check your JSON structure"}
         
         # Save workflow to temp file
         workflow_file = "/tmp/workflow_api.json"
         with open(workflow_file, 'w') as f:
-            json.dump(workflow, f)
+            json.dump(workflow, f, indent=2)
         print(f"Saved workflow to {workflow_file}", flush=True)
         
         # Check volume
         volume_path = "/runpod-volume/ComfyUI/models"
         if os.path.exists(volume_path):
             print(f"✓ Volume found at {volume_path}", flush=True)
+            # List model directories
+            for subdir in ['unet', 'vae', 'clip', 'loras']:
+                path = f"{volume_path}/{subdir}"
+                if os.path.exists(path):
+                    files = os.listdir(path)
+                    print(f"  {subdir}: {files[:3]}", flush=True)
         else:
             return {"error": f"Volume not found at {volume_path}"}
         
         # Start ComfyUI server
         print("Starting ComfyUI server...", flush=True)
-        
-        env = os.environ.copy()
-        env["COMFYUI_MODEL_PATHS"] = json.dumps({
-            "checkpoints": "/runpod-volume/ComfyUI/models/unet",
-            "vae": "/runpod-volume/ComfyUI/models/vae",
-            "clip": "/runpod-volume/ComfyUI/models/clip",
-            "loras": "/runpod-volume/ComfyUI/models/loras",
-        })
         
         comfyui_cmd = [
             "python", "/app/ComfyUI/main.py",
@@ -57,7 +74,6 @@ def handler(event):
         
         process = subprocess.Popen(
             comfyui_cmd,
-            env=env,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True
