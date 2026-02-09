@@ -1,12 +1,16 @@
 #!/bin/bash
 
-echo "[DAEMON] Starting ComfyUI..."
+echo "Starting ComfyUI daemon..."
 
-python /app/ComfyUI/main.py \
-  --listen 127.0.0.1 \
-  --port 8188 \
-  --disable-auto-launch \
-  --dont-print-server \
-  --output-directory /tmp/output \
-  --extra-model-paths-config \
-  /runpod-volume/runpod-slim/ComfyUI/extra_model_paths.yaml
+cd /app/ComfyUI
+
+mkdir -p models
+rm -rf models
+ln -s /runpod-volume/runpod-slim/ComfyUI models
+
+python main.py \
+--listen 0.0.0.0 \
+--port 8188 \
+--force-fp16 \
+--dont-print-server \
+--disable-auto-launch
