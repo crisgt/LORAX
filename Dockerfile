@@ -17,3 +17,5 @@ COPY start_comfy_daemon.sh /app/start_comfy_daemon.sh
 RUN chmod +x /app/start_comfy_daemon.sh
 
 CMD /app/start_comfy_daemon.sh & python -u /app/handler.py
+
+
