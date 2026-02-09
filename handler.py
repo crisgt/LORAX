@@ -1,188 +1,138 @@
 import runpod
-import json
 import subprocess
-import os
-import time
 import requests
+import time
+import os
 import base64
+import json
 
-print("Handler starting...", flush=True)
+COMFY_PORT = "8188"
+COMFY_URL = f"http://127.0.0.1:{COMFY_PORT}"
+COMFY_CMD = [
+    "python",
+    "/app/ComfyUI/main.py",
+    "--listen", "127.0.0.1",
+    "--port", COMFY_PORT,
+    "--output-directory", "/tmp/output",
+    "--disable-auto-launch"
+]
+
+def start_comfy():
+    process = subprocess.Popen(
+        COMFY_CMD,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.STDOUT
+    )
+
+    for _ in range(60):
+        try:
+            r = requests.get(f"{COMFY_URL}/system_stats", timeout=2)
+            if r.status_code == 200:
+                return process
+        except:
+            pass
+        time.sleep(1)
+
+    process.kill()
+    raise RuntimeError("ComfyUI failed to start")
+
+def queue_prompt(prompt):
+    r = requests.post(
+        f"{COMFY_URL}/prompt",
+        json={"prompt": prompt},
+        timeout=30
+    )
+
+    if r.status_code != 200:
+        raise RuntimeError(r.text)
+
+    data = r.json()
+    return data.get("prompt_id")
+
+def wait_for_images(prompt_id):
+    images = []
+
+    for _ in range(150):
+        try:
+            r = requests.get(
+                f"{COMFY_URL}/history/{prompt_id}",
+                timeout=5
+            )
+
+            if r.status_code == 200:
+                hist = r.json()
+
+                if prompt_id in hist:
+                    outputs = hist[prompt_id].get("outputs", {})
+
+                    for node in outputs.values():
+                        if "images" in node:
+                            for img in node["images"]:
+                                url = (
+                                    f"{COMFY_URL}/view?"
+                                    f"filename={img['filename']}&"
+                                    f"subfolder={img['subfolder']}&"
+                                    f"type=output"
+                                )
+
+                                img_r = requests.get(url, timeout=10)
+
+                                if img_r.status_code == 200:
+                                    images.append(
+                                        base64.b64encode(
+                                            img_r.content
+                                        ).decode()
+                                    )
+                    if images:
+                        return images
+        except:
+            pass
+
+        time.sleep(2)
+
+    return []
 
 def handler(event):
-    """Simple handler that accepts workflow JSON"""
-    print("=" * 50, flush=True)
-    print("Handler called!", flush=True)
-    
     try:
         input_data = event.get("input", {})
-        print(f"Received input with keys: {list(input_data.keys())}", flush=True)
-        
-        # Get workflow
-        if "workflow" not in input_data:
-            return {"error": "Missing 'workflow' in input"}
-        
-        workflow = input_data["workflow"]
-        
-        # Handle if workflow is a string (needs parsing)
-        if isinstance(workflow, str):
-            print("Workflow is a string, parsing JSON...", flush=True)
-            try:
-                workflow = json.loads(workflow)
-            except json.JSONDecodeError as e:
-                return {"error": f"Invalid workflow JSON: {e}"}
-        
-        # Validate workflow structure
-        if not isinstance(workflow, dict):
-            return {"error": f"Workflow must be a JSON object, got {type(workflow)}"}
-        
-        if "nodes" not in workflow:
-            return {"error": "Workflow missing 'nodes' key"}
-        
-        print(f"Workflow has {len(workflow.get('nodes', []))} nodes", flush=True)
-        
-        if len(workflow.get('nodes', [])) == 0:
-            return {"error": "Workflow has 0 nodes - check your JSON structure"}
-        
-        # Save workflow to temp file
-        workflow_file = "/tmp/workflow_api.json"
-        with open(workflow_file, 'w') as f:
-            json.dump(workflow, f, indent=2)
-        print(f"Saved workflow to {workflow_file}", flush=True)
-        
-        # Check volume
-        volume_path = "/runpod-volume/ComfyUI/models"
-        if os.path.exists(volume_path):
-            print(f"✓ Volume found at {volume_path}", flush=True)
-            # List model directories
-            for subdir in ['unet', 'vae', 'clip', 'loras']:
-                path = f"{volume_path}/{subdir}"
-                if os.path.exists(path):
-                    files = os.listdir(path)
-                    print(f"  {subdir}: {files[:3]}", flush=True)
-        else:
-            return {"error": f"Volume not found at {volume_path}"}
-        
-        # Start ComfyUI server
-        print("Starting ComfyUI server...", flush=True)
-        
-        comfyui_cmd = [
-            "python", "/app/ComfyUI/main.py",
-            "--listen", "127.0.0.1",
-            "--port", "8188",
-            "--output-directory", "/tmp/output"
-        ]
-        
-        process = subprocess.Popen(
-            comfyui_cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True
-        )
-        
-        # Wait for server to be ready
-        print("Waiting for ComfyUI to start...", flush=True)
-        server_ready = False
-        
-        for i in range(60):
-            try:
-                resp = requests.get("http://127.0.0.1:8188/system_stats", timeout=2)
-                if resp.status_code == 200:
-                    server_ready = True
-                    print(f"✓ ComfyUI ready after {i+1}s", flush=True)
-                    break
-            except:
-                pass
-            time.sleep(1)
-        
-        if not server_ready:
-            process.kill()
-            return {"error": "ComfyUI failed to start within 60s"}
-        
-        # Queue the workflow
-        print("Queueing workflow...", flush=True)
-        
-        queue_url = "http://127.0.0.1:8188/prompt"
-        prompt_request = {"prompt": workflow}
-        
-        resp = requests.post(queue_url, json=prompt_request, timeout=10)
-        
-        if resp.status_code != 200:
-            process.kill()
-            return {"error": f"Failed to queue: {resp.text}"}
-        
-        queue_result = resp.json()
-        prompt_id = queue_result.get("prompt_id")
-        
+
+        if "prompt" not in input_data:
+            return {"error": "Missing input.prompt"}
+
+        prompt = input_data["prompt"]
+
+        if not isinstance(prompt, dict):
+            return {"error": "prompt must be JSON object"}
+
+        if not os.path.exists("/runpod-volume/ComfyUI/models"):
+            return {"error": "Model volume missing"}
+
+        process = start_comfy()
+
+        prompt_id = queue_prompt(prompt)
+
         if not prompt_id:
             process.kill()
-            return {"error": f"No prompt_id: {queue_result}"}
-        
-        print(f"✓ Queued with prompt_id: {prompt_id}", flush=True)
-        
-        # Wait for completion
-        print("Waiting for generation...", flush=True)
-        output_images = []
-        
-        for wait_count in range(150):  # 5 minutes max
-            try:
-                history_resp = requests.get(f"http://127.0.0.1:8188/history/{prompt_id}", timeout=5)
-                
-                if history_resp.status_code == 200:
-                    history = history_resp.json()
-                    
-                    if prompt_id in history:
-                        print(f"Found result in history", flush=True)
-                        outputs = history[prompt_id].get("outputs", {})
-                        
-                        for node_id, node_output in outputs.items():
-                            if "images" in node_output:
-                                print(f"Found images in node {node_id}", flush=True)
-                                
-                                for img_info in node_output["images"]:
-                                    filename = img_info.get("filename", "")
-                                    subfolder = img_info.get("subfolder", "")
-                                    
-                                    # Download image
-                                    img_url = f"http://127.0.0.1:8188/view?filename={filename}&subfolder={subfolder}&type=output"
-                                    img_resp = requests.get(img_url, timeout=10)
-                                    
-                                    if img_resp.status_code == 200:
-                                        img_b64 = base64.b64encode(img_resp.content).decode()
-                                        output_images.append(img_b64)
-                                        print(f"✓ Got image: {filename}", flush=True)
-                        
-                        if output_images:
-                            break
-            except Exception as e:
-                print(f"Wait loop error: {e}", flush=True)
-            
-            if wait_count % 10 == 0:
-                print(f"Still waiting... ({wait_count}s)", flush=True)
-            
-            time.sleep(2)
-        
-        # Cleanup
+            return {"error": "No prompt_id returned"}
+
+        images = wait_for_images(prompt_id)
+
         process.kill()
-        
-        if not output_images:
+
+        if not images:
             return {"error": "No images generated"}
-        
-        print(f"✓ Success! Generated {len(output_images)} image(s)", flush=True)
-        
+
         return {
             "status": "success",
-            "images": output_images,
-            "prompt_id": prompt_id
-        }
-        
-    except Exception as e:
-        import traceback
-        error_trace = traceback.format_exc()
-        print(f"ERROR: {error_trace}", flush=True)
-        return {
-            "error": str(e),
-            "traceback": error_trace
+            "prompt_id": prompt_id,
+            "images": images
         }
 
-print("Starting RunPod handler...", flush=True)
+    except Exception as e:
+        import traceback
+        return {
+            "error": str(e),
+            "traceback": traceback.format_exc()
+        }
+
 runpod.serverless.start({"handler": handler})
